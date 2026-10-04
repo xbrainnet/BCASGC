@@ -5,6 +5,7 @@ import csv
 import json
 import random
 from copy import deepcopy
+from itertools import product
 from pathlib import Path
 
 import numpy as np
@@ -13,10 +14,16 @@ from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
 from torch.utils.data import DataLoader
 from tqdm import trange
 
-from asvgcn.data import BrainDataset, load_brain_arrays
-from asvgcn.losses import total_loss
-from asvgcn.metrics import classification_metrics
-from asvgcn.model import ASVGCN
+try:
+    from asvgcn.data import BrainDataset, load_brain_arrays
+    from asvgcn.losses import total_loss
+    from asvgcn.metrics import classification_metrics
+    from asvgcn.model import ASVGCN
+except ImportError:
+    from data import BrainDataset, load_brain_arrays
+    from losses import total_loss
+    from metrics import classification_metrics
+    from model import ASVGCN
 
 
 def seed_everything(seed: int):
@@ -43,7 +50,7 @@ def evaluate(model, loader, device):
     return metrics, y_true, prob, np.concatenate(selected_ks)
 
 
-def make_model(config, num_classes, input_dim):
+def make_model(config, num_classes, input_dim, alpha, beta):
     return ASVGCN(
         num_classes=num_classes,
         input_dim=input_dim,
@@ -52,11 +59,75 @@ def make_model(config, num_classes, input_dim):
         min_k=config["min_k"],
         max_k=config["max_k"],
         rho=config["rho"],
-        alpha=config["alpha"],
-        beta=config["beta"],
+        alpha=alpha,
+        beta=beta,
         fc_threshold=config["fc_threshold"],
         dropout=config["dropout"],
     )
+
+
+def train_candidate(config, arrays, fold, train_dataset, val_loader, device, alpha, beta):
+    # Reset the random state so all grid candidates use the same initialization
+    # and mini-batch order within the current outer fold.
+    candidate_seed = config["seed"] + fold
+    seed_everything(candidate_seed)
+    generator = torch.Generator().manual_seed(candidate_seed)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config["batch_size"],
+        shuffle=True,
+        generator=generator,
+    )
+    model = make_model(
+        config,
+        len(np.unique(arrays.labels)),
+        arrays.fmri.shape[-1],
+        alpha,
+        beta,
+    ).to(device)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=config["learning_rate"],
+        weight_decay=config["weight_decay"],
+    )
+    best_state = None
+    best_score = -np.inf
+    best_epoch = 0
+    best_metrics = None
+    bad_epochs = 0
+    selection_metric = config.get("selection_metric", "ACC")
+
+    for epoch in trange(
+        config["epochs"],
+        desc=f"fold {fold}: alpha={alpha}, beta={beta}",
+        leave=False,
+    ):
+        model.train()
+        for fmri, dti, y in train_loader:
+            fmri, dti, y = fmri.to(device), dti.to(device), y.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            output = model(fmri, dti)
+            loss, _, _ = total_loss(output, y, dti, config["community_weight"])
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            optimizer.step()
+
+        val_metrics, _, _, _ = evaluate(model, val_loader, device)
+        score = val_metrics[selection_metric]
+        if score > best_score + 1e-6:
+            best_score = score
+            best_state = deepcopy(model.state_dict())
+            best_epoch = epoch + 1
+            best_metrics = val_metrics
+            bad_epochs = 0
+        else:
+            bad_epochs += 1
+            if bad_epochs >= config["patience"]:
+                break
+
+    if best_state is None:
+        raise RuntimeError("Training ended without a valid validation checkpoint")
+    return best_state, best_score, best_epoch, best_metrics
 
 
 def run_fold(config, arrays, fold, train_val_idx, test_idx, device, output_dir):
@@ -65,46 +136,80 @@ def run_fold(config, arrays, fold, train_val_idx, test_idx, device, output_dir):
     )
     relative_train, relative_val = next(splitter.split(train_val_idx, arrays.labels[train_val_idx]))
     train_idx, val_idx = train_val_idx[relative_train], train_val_idx[relative_val]
-    generator = torch.Generator().manual_seed(config["seed"] + fold)
-    loaders = {
-        "train": DataLoader(BrainDataset(arrays, train_idx), batch_size=config["batch_size"], shuffle=True, generator=generator),
-        "val": DataLoader(BrainDataset(arrays, val_idx), batch_size=config["batch_size"], shuffle=False),
-        "test": DataLoader(BrainDataset(arrays, test_idx), batch_size=config["batch_size"], shuffle=False),
-    }
+    train_dataset = BrainDataset(arrays, train_idx)
+    val_loader = DataLoader(
+        BrainDataset(arrays, val_idx),
+        batch_size=config["batch_size"],
+        shuffle=False,
+    )
+    test_loader = DataLoader(
+        BrainDataset(arrays, test_idx),
+        batch_size=config["batch_size"],
+        shuffle=False,
+    )
 
-    model = make_model(config, len(np.unique(arrays.labels)), arrays.fmri.shape[-1]).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
-    best_state, best_val, bad_epochs, best_epoch = None, -np.inf, 0, 0
+    best_state = None
+    best_val = -np.inf
+    best_epoch = 0
+    best_alpha = None
+    best_beta = None
+    grid_rows = []
 
-    for epoch in trange(config["epochs"], desc=f"fold {fold}", leave=False):
-        model.train()
-        for fmri, dti, y in loaders["train"]:
-            fmri, dti, y = fmri.to(device), dti.to(device), y.to(device)
-            optimizer.zero_grad(set_to_none=True)
-            output = model(fmri, dti)
-            loss, _, _ = total_loss(output, y, dti, config["community_weight"])
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            optimizer.step()
-        val_metrics, _, _, _ = evaluate(model, loaders["val"], device)
-        score = 0.5 * (val_metrics["ACC"] + val_metrics["AUC"])
+    for alpha, beta in product(config["alpha_grid"], config["beta_grid"]):
+        state, score, epoch, val_metrics = train_candidate(
+            config,
+            arrays,
+            fold,
+            train_dataset,
+            val_loader,
+            device,
+            alpha,
+            beta,
+        )
+        grid_rows.append({
+            "fold": fold,
+            "alpha": alpha,
+            "beta": beta,
+            "best_epoch": epoch,
+            "selection_metric": config.get("selection_metric", "ACC"),
+            "selection_score": score,
+            "val_ACC": val_metrics["ACC"],
+            "val_AUC": val_metrics["AUC"],
+            "val_SPE": val_metrics["SPE"],
+            "val_SEN": val_metrics["SEN"],
+        })
         if score > best_val + 1e-6:
-            best_val, best_state, best_epoch = score, deepcopy(model.state_dict()), epoch + 1
-            bad_epochs = 0
-        else:
-            bad_epochs += 1
-            if bad_epochs >= config["patience"]:
-                break
+            best_val = score
+            best_state = state
+            best_epoch = epoch
+            best_alpha = alpha
+            best_beta = beta
 
-    if best_state is None:
-        raise RuntimeError("Training ended without a valid checkpoint")
+    with (output_dir / f"fold_{fold:02d}_grid_search.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as f:
+        writer = csv.DictWriter(f, fieldnames=grid_rows[0].keys())
+        writer.writeheader()
+        writer.writerows(grid_rows)
+
+    model = make_model(
+        config,
+        len(np.unique(arrays.labels)),
+        arrays.fmri.shape[-1],
+        best_alpha,
+        best_beta,
+    ).to(device)
     model.load_state_dict(best_state)
-    test_metrics, y_true, prob, selected_k = evaluate(model, loaders["test"], device)
+    # The test set is evaluated only once, after grid-search selection is complete.
+    test_metrics, y_true, prob, selected_k = evaluate(model, test_loader, device)
     checkpoint = {
         "model_state": best_state,
         "config": config,
         "fold": fold,
         "best_epoch": best_epoch,
+        "best_alpha": best_alpha,
+        "best_beta": best_beta,
+        "best_validation_score": best_val,
         "label_values": np.unique(arrays.labels).tolist(),
     }
     torch.save(checkpoint, output_dir / f"fold_{fold:02d}.pt")
@@ -112,7 +217,14 @@ def run_fold(config, arrays, fold, train_val_idx, test_idx, device, output_dir):
         output_dir / f"fold_{fold:02d}_predictions.npz",
         indices=test_idx, labels=y_true, probabilities=prob, selected_k=selected_k,
     )
-    return {"fold": fold, "best_epoch": best_epoch, **test_metrics}
+    return {
+        "fold": fold,
+        "best_alpha": best_alpha,
+        "best_beta": best_beta,
+        "best_epoch": best_epoch,
+        "validation_score": best_val,
+        **test_metrics,
+    }
 
 
 def main():
@@ -149,4 +261,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -7,7 +7,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from data import BrainDataset, load_brain_arrays
+try:
+    from asvgcn.data import BrainDataset, load_brain_arrays
+except ImportError:
+    from data import BrainDataset, load_brain_arrays
 from train import make_model
 
 
@@ -23,7 +26,13 @@ def main():
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = checkpoint["config"]
     arrays = load_brain_arrays(args.data, args.fmri_key, args.dti_key, args.label_key, config["nodes"])
-    model = make_model(config, len(checkpoint["label_values"]), arrays.fmri.shape[-1])
+    model = make_model(
+        config,
+        len(checkpoint["label_values"]),
+        arrays.fmri.shape[-1],
+        checkpoint["best_alpha"],
+        checkpoint["best_beta"],
+    )
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     dataset = BrainDataset(arrays, np.arange(len(arrays.labels)))
@@ -39,4 +48,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
